@@ -1,0 +1,17 @@
+# CLEVR itself (19 GB archive, ~19 GB extracted) and any subsets built from it
+# (~180 MB each). None of it is shared: contributors regenerate subsets from the
+# recipe in the README, and `clevrbench verify --expect` proves they got the
+# identical sample. `clevrbench eval` fetches whatever is missing on its own.
+data/
+
+# Evaluation outputs are small (a few hundred KB per run) and are the evidence
+# behind the numbers in the README, so they stay tracked. Uncomment to drop them.
+runs/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/

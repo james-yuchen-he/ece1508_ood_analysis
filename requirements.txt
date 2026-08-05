@@ -1,0 +1,10 @@
+# Core harness (subset building, baselines, metrics) needs only Pillow.
+Pillow>=9.0
+
+# Running an actual VLM adapter.
+torch>=2.0
+transformers>=4.37
+accelerate>=0.26
+
+# Progress bars; the harness falls back to plain output without it.
+tqdm>=4.60
