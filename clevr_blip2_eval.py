@@ -22,7 +22,6 @@ import torch
 from PIL import Image
 from transformers import Blip2ForConditionalGeneration, Blip2Processor
 
-from clevr_blip2_qcond import build_qcond_model, qcond_generate
 from clevr_common import (
     PROMPT,
     QUESTION_TYPE_ID,
@@ -66,20 +65,12 @@ def main():
     stop_ids = [processor.tokenizer.eos_token_id] + processor.tokenizer(
         "\n", add_special_tokens=False
     ).input_ids
-    qformer_tokenizer = None
+    model = Blip2ForConditionalGeneration.from_pretrained(MODEL_ID, torch_dtype=dtype)
     if args.qformer_checkpoint:
         state = torch.load(args.qformer_checkpoint, weights_only=True)
-        if any(k.startswith("qformer_text_embeddings.") for k in state):
-            # Question-conditioned Q-Former checkpoint (clevr_blip2_qcond.py).
-            model, qformer_tokenizer = build_qcond_model(dtype, state=state)
-        else:
-            model = Blip2ForConditionalGeneration.from_pretrained(MODEL_ID, torch_dtype=dtype)
-            missing, unexpected = model.load_state_dict(state, strict=False)
-            assert not unexpected, f"unexpected keys in checkpoint: {unexpected[:5]}"
-        print(f"loaded {len(state)} finetuned tensors from {args.qformer_checkpoint}"
-              f" (question-conditioned: {qformer_tokenizer is not None})")
-    else:
-        model = Blip2ForConditionalGeneration.from_pretrained(MODEL_ID, torch_dtype=dtype)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        assert not unexpected, f"unexpected keys in checkpoint: {unexpected[:5]}"
+        print(f"loaded {len(state)} finetuned tensors from {args.qformer_checkpoint}")
     model.to(device)
     model.eval()
 
@@ -118,19 +109,7 @@ def main():
                 device, dtype
             )
             with torch.no_grad():
-                if qformer_tokenizer is not None:
-                    q_enc = qformer_tokenizer(
-                        [q["question"] for q in batch],
-                        padding=True, truncation=True, max_length=64, return_tensors="pt",
-                    ).to(device)
-                    generated = qcond_generate(
-                        model, **inputs,
-                        qformer_input_ids=q_enc["input_ids"],
-                        qformer_attention_mask=q_enc["attention_mask"],
-                        max_new_tokens=10, eos_token_id=stop_ids,
-                    )
-                else:
-                    generated = model.generate(**inputs, max_new_tokens=10, eos_token_id=stop_ids)
+                generated = model.generate(**inputs, max_new_tokens=10, eos_token_id=stop_ids)
             decoded = processor.batch_decode(generated, skip_special_tokens=True)
             # Some transformers versions echo the prompt in the output; keep
             # only the generated continuation.

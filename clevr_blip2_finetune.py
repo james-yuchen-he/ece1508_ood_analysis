@@ -13,13 +13,8 @@ Deviations from the paper, by design:
   frozen along with the LLM. (Remove language_projection below to train
   strictly the Q-Former weights.)
 - Image resolution stays at the checkpoint's 224 (paper uses 490).
-- The prompt keeps "Short answer:" to match our eval.
-
-As in the paper, the Q-Former is additionally conditioned on the question
-(see clevr_blip2_qcond.py; run `python clevr_blip2_qcond.py` once first to
-fetch the stage-1 text-pathway weights). The grafted text pathway itself
-stays frozen as a fixed question encoder — training it too would not fit a
-12GB GPU. Pass --no-qcond for the image-only Q-Former behavior.
+- The question is not fed to the Q-Former (the HF BLIP-2 architecture has no
+  text path into it) and the prompt keeps "Short answer:" to match our eval.
 
 The checkpoint stores only the trainable parameters. To use it at eval time:
 
@@ -46,12 +41,6 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from transformers import Blip2ForConditionalGeneration, Blip2Processor
 
-from clevr_blip2_qcond import (
-    build_qcond_model,
-    freeze_text_pathway,
-    qcond_loss,
-    text_pathway_state,
-)
 from clevr_common import PROMPT
 
 CLEVR_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "CLEVR_v1.0")
@@ -78,7 +67,7 @@ class ClevrTrain(Dataset):
         return {"image": image, "question": q["question"], "answer": q["answer"]}
 
 
-def make_collate(processor, qformer_tokenizer=None):
+def make_collate(processor):
     tokenizer = processor.tokenizer
 
     def collate(batch):
@@ -100,13 +89,6 @@ def make_collate(processor, qformer_tokenizer=None):
             seq_len = int(enc["attention_mask"][i].sum())
             labels[i, : seq_len - answer_len] = -100
         enc["labels"] = labels
-        if qformer_tokenizer is not None:
-            q_enc = qformer_tokenizer(
-                [b["question"] for b in batch],
-                padding=True, truncation=True, max_length=64, return_tensors="pt",
-            )
-            enc["qformer_input_ids"] = q_enc["input_ids"]
-            enc["qformer_attention_mask"] = q_enc["attention_mask"]
         return enc
 
     return collate
@@ -114,9 +96,6 @@ def make_collate(processor, qformer_tokenizer=None):
 
 def save_trainable(model, path):
     state = {n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad}
-    if hasattr(model, "qformer_text_embeddings"):
-        # Include the frozen text pathway so the checkpoint is self-contained.
-        state.update({n: p.detach().cpu() for n, p in text_pathway_state(model).items()})
     torch.save(state, path)
     print(f"saved checkpoint -> {path}", flush=True)
 
@@ -124,9 +103,9 @@ def save_trainable(model, path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=1, help="paper uses 5")
-    parser.add_argument("--batch-size", type=int, default=4,
-                        help="micro-batch; 4 fits a 12GB GPU (8 with --no-qcond)")
-    parser.add_argument("--grad-accum", type=int, default=32,
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="micro-batch; 8 fits a 12GB GPU")
+    parser.add_argument("--grad-accum", type=int, default=16,
                         help="batch_size * grad_accum = effective batch (paper: 128)")
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--warmup-steps", type=int, default=1000,
@@ -137,8 +116,6 @@ def main():
     parser.add_argument("--save-every", type=int, default=500,
                         help="optimizer steps between checkpoints")
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--no-qcond", action="store_true",
-                        help="do not condition the Q-Former on the question")
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "finetuning requires a CUDA GPU"
@@ -153,11 +130,7 @@ def main():
     # labels line up (generation-time left padding is not needed here).
     processor.tokenizer.padding_side = "right"
 
-    if args.no_qcond:
-        model = Blip2ForConditionalGeneration.from_pretrained(MODEL_ID, torch_dtype=frozen_dtype)
-        qformer_tokenizer = None
-    else:
-        model, qformer_tokenizer = build_qcond_model(frozen_dtype)
+    model = Blip2ForConditionalGeneration.from_pretrained(MODEL_ID, torch_dtype=frozen_dtype)
     model.to(device)
 
     # Freeze everything, then re-enable the bridge in fp32 for stable
@@ -168,8 +141,6 @@ def main():
         module.to(torch.float32)
         for p in module.parameters():
             p.requires_grad_(True)
-    if not args.no_qcond:
-        freeze_text_pathway(model)
     model.query_tokens.data = model.query_tokens.data.float()
     model.query_tokens.requires_grad_(True)
 
@@ -185,7 +156,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=make_collate(processor, qformer_tokenizer),
+        collate_fn=make_collate(processor),
     )
 
     steps_per_epoch = math.ceil(len(loader) / args.grad_accum)
@@ -212,10 +183,7 @@ def main():
         for i, batch in enumerate(loader):
             batch = {k: v.to(device) for k, v in batch.items()}
             with torch.autocast("cuda", dtype=frozen_dtype):
-                if args.no_qcond:
-                    loss = model(**batch).loss / args.grad_accum
-                else:
-                    loss = qcond_loss(model, **batch) / args.grad_accum
+                loss = model(**batch).loss / args.grad_accum
             loss.backward()
             running += loss.item()
 
